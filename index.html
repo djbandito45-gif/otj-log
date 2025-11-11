@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OTJ Apprenticeship Log Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Include SheetJS library for Excel/CSV parsing and generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.17.0/xlsx.full.min.js"></script> 
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, serverTimestamp, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- APPLICATION STATE ---
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        let logEntries = []; // Combined array of Firestore and Imported data
+        let importedEntries = []; // Entries loaded from the user's uploaded CSV file
+        
+        let metadataRows = []; // Stores all template rows (metadata + header row) for export (Public/Shared)
+
+        let goals = {
+            agreedTotalHours: 1100,
+            calculatedMinimum: 1068.73,
+            startDate: '2023-09-11',
+            gatewayDate: '2026-07-24',
+            classroomHours: 360 // Pre-logged hours
+        };
+
+        // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+        async function setupFirebase() {
+            try {
+                if (!firebaseConfig) {
+                    throw new Error("Firebase configuration is missing.");
+                }
+
+                setLogLevel('error');
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        document.getElementById('auth-status').textContent = `Log Scope: Private (User ID: ${userId})`;
+                        console.log("Firebase Auth Ready. User:", userId);
+                        await initMetadata(); // Load template and goals (still public/shared)
+                        setupLogListener(); // Now loads private data
+                    } else {
+                        // Attempt silent sign-in if token is available
+                        if (initialAuthToken && initialAuthToken.length > 0) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            // Fallback to anonymous sign-in
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase setup failed:", error);
+                document.getElementById('auth-status').textContent = `Authentication Error: ${error.message}`;
+                isAuthReady = true; 
+                renderProgress();
+            }
+        }
+
+        // --- METADATA/GOALS MANAGEMENT (PUBLIC/SHARED) ---
+        // These remain public as they define the common apprenticeship structure.
+
+        const getGoalsRef = () => doc(db, "artifacts", appId, "public", "data", "otj_metrics", "goals");
+        const getTemplateRef = () => doc(db, "artifacts", appId, "public", "data", "otj_metrics", "template");
+
+        async function initMetadata() {
+            if (!db) return;
+            // Load Goals
+            const goalsRef = getGoalsRef();
+            const docSnap = await getDoc(goalsRef);
+            if (docSnap.exists()) {
+                goals = { ...goals, ...docSnap.data() };
+            }
+
+            // Load Template Metadata
+            const templateSnap = await getDoc(getTemplateRef());
+            if (templateSnap.exists() && templateSnap.data().rows) {
+                metadataRows = templateSnap.data().rows;
+            }
+            
+            renderProgress();
+        }
+
+        async function saveGoals(newGoals) {
+            if (!db) return;
+            try {
+                await setDoc(getGoalsRef(), newGoals, { merge: true });
+                goals = newGoals;
+                renderProgress();
+            } catch (e) {
+                console.error("Error saving goals:", e);
+            }
+        }
+
+        async function saveTemplateMetadata(rows) {
+            if (!db) return;
+            try {
+                // Ensure rows array is saved correctly
+                await setDoc(getTemplateRef(), { rows: rows }, { merge: true });
+            } catch (e) {
+                console.error("Error saving template metadata:", e);
+            }
+        }
+
+        // --- LOG ENTRY MANAGEMENT (PRIVATE/USER-SPECIFIC) ---
+
+        // NEW: Data is stored in a PRIVATE collection for individual user security.
+        const getEntriesCollectionRef = () => {
+            if (!userId || !db) return null;
+            // Path change: from 'public' to 'users/${userId}'
+            return collection(db, "artifacts", appId, "users", userId, "otj_entries");
+        };
+
+        function setupLogListener() {
+            if (!db || !userId) {
+                // Load only imported data if Firebase isn't ready
+                logEntries = [...importedEntries];
+                logEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
+                renderProgress();
+                renderLog();
+                return;
+            }
+
+            const entriesRef = getEntriesCollectionRef();
+            if (!entriesRef) return;
+
+            const q = query(entriesRef);
+
+            onSnapshot(q, (snapshot) => {
+                let firestoreEntries = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    // Handle Firestore Timestamp objects or plain date strings
+                    const dateStr = data.date instanceof Date ? data.date.toISOString().split('T')[0] : data.date;
+
+                    firestoreEntries.push({
+                        id: doc.id,
+                        date: dateStr,
+                        description: data.description,
+                        hours: parseFloat(data.hours),
+                        timestamp: data.timestamp,
+                        source: 'Real-Time'
+                    });
+                });
+
+                // Combine imported CSV data and private Firestore data
+                logEntries = [...importedEntries, ...firestoreEntries];
+                
+                // Client-side sort: sorting by date (latest first)
+                logEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+                console.log(`Received ${firestoreEntries.length} new private log entries. Total: ${logEntries.length}`);
+                renderProgress();
+                renderLog();
+            }, (error) => {
+                console.error("Error setting up log listener:", error);
+                showToast("Failed to load real-time log entries.", 'bg-red-500');
+            });
+        }
+
+        async function addEntry(event) {
+            event.preventDefault();
+            if (!isAuthReady || !db || !userId) {
+                showToast("App is still loading or failed to authenticate. Cannot save log.", 'bg-yellow-500');
+                return;
+            }
+
+            const date = document.getElementById('logDate').value;
+            const description = document.getElementById('logDescription').value.trim();
+            const hours = document.getElementById('logHours').value;
+
+            if (!date || !description || !hours || parseFloat(hours) <= 0) {
+                showToast("Please fill out all fields correctly.", 'bg-yellow-500');
+                return;
+            }
+
+            const newEntry = {
+                date: date,
+                description: description,
+                hours: parseFloat(hours),
+                timestamp: serverTimestamp()
+            };
+
+            try {
+                const entriesRef = getEntriesCollectionRef();
+                if (!entriesRef) throw new Error("Authentication not complete. Cannot save log.");
+                
+                await addDoc(entriesRef, newEntry);
+                showToast("Log entry saved successfully!", 'bg-green-500');
+                // Clear the form
+                document.getElementById('logForm').reset();
+                document.getElementById('logDate').value = new Date().toISOString().split('T')[0]; // Reset to today's date
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                showToast(`Error saving: ${e.message}`, 'bg-red-500');
+            }
+        }
+
+        // --- IMPORT FUNCTIONALITY ---
+        
+        // Simple CSV parser for the expected structure (Date, Description, ..., Hours)
+        function parseCsvData(csvText, allRows) {
+            const newEntries = [];
+
+            // Find the header row (assuming 'Activity Description' is present)
+            let dataStartRow = 0;
+            const lines = csvText.split('\n');
+            const headerIndex = lines.findIndex(line => line.includes('Activity Description'));
+            
+            if (headerIndex !== -1) {
+                dataStartRow = headerIndex + 1;
+            } else {
+                dataStartRow = 7; 
+            }
+
+            // --- Capture Metadata Rows ---
+            if (allRows && allRows.length > 0) {
+                 const capturedTemplate = allRows.slice(0, dataStartRow);
+                 // Save for persistent export templating
+                 saveTemplateMetadata(capturedTemplate); 
+                 metadataRows = capturedTemplate; // Update local state immediately
+            }
+
+
+            for (let i = dataStartRow; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line) continue;
+
+                // Simple comma split
+                const columns = line.split(',');
+                
+                // Based on your original file structure: Col 0(Date), Col 1(Desc), Col 6(Hours)
+                
+                const date = columns[0].trim();
+                const description = columns[1] ? columns[1].trim().replace(/"/g, '') : '';
+                const hours = columns[6] ? parseFloat(columns[6].trim()) : 0;
+
+                if (date && description && hours > 0 && !isNaN(new Date(date))) {
+                    newEntries.push({
+                        date: date,
+                        description: description,
+                        hours: hours,
+                        source: 'Imported'
+                    });
+                }
+            }
+            return newEntries;
+        }
+
+        window.handleFileImport = function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const fileName = file.name.toLowerCase();
+            if (!(fileName.endsWith('.csv') || fileName.endsWith('.xlsx') || fileName.endsWith('.xls'))) {
+                showToast("Please upload a CSV, XLSX, or XLS file.", 'bg-red-500');
+                return;
+            }
+
+            const reader = new FileReader();
+
+            reader.onload = (e) => {
+                try {
+                    const data = new Uint8Array(e.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    
+                    const sheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[sheetName];
+                    
+                    // Convert the entire sheet to an array of arrays (AoA) to capture metadata rows
+                    const allRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false });
+                    
+                    // Convert the sheet data to a CSV string for our existing parser (needs raw text for splitting)
+                    const csvText = XLSX.utils.sheet_to_csv(worksheet, { FS: ',', RS: '\n' });
+
+                    const newEntries = parseCsvData(csvText, allRows);
+
+                    if (newEntries.length > 0) {
+                        importedEntries = newEntries;
+                        setupLogListener(); // Re-trigger listener to combine data
+                        showToast(`Successfully imported ${newEntries.length} historical entries from '${sheetName}'! 
+                                  Template saved for export.`, 'bg-green-500');
+                    } else {
+                        showToast("Could not parse any valid entries. Ensure Date (A), Description (B), and Hours (G) columns are correct.", 'bg-red-500');
+                    }
+                } catch (error) {
+                    console.error("File import failed:", error);
+                    showToast(`An error occurred during file processing: ${error.message}`, 'bg-red-500');
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // --- EXPORT FUNCTIONALITY (TEMPLATED XLSX EXPORT) ---
+
+        window.exportToXlsx = function() {
+            if (logEntries.length === 0) {
+                showToast("No entries to export.", 'bg-red-500');
+                return;
+            }
+            
+            // 1. Start with the saved template metadata (top rows of the spreadsheet, including the original header)
+            const exportData = [...metadataRows]; 
+
+            // Check for missing template: If template is missing, warn and use a fallback header
+            if (exportData.length === 0) {
+                 showToast("Warning: No template imported. Exporting with default headers.", 'bg-yellow-500');
+                 exportData.push(["Date", "Activity Description", null, null, null, null, "Hours", "Initials of Signer", "Source"]);
+            }
+
+            // 2. Append all log entries to the final export data structure
+            logEntries.forEach(entry => {
+                const row = [
+                    entry.date, 
+                    entry.description, 
+                    null, 
+                    null, 
+                    null, 
+                    null, 
+                    entry.hours, 
+                    "", // H: Initials (left blank for user to manually sign/fill)
+                    entry.source || (entry.id ? 'Real-Time (Firestore)' : 'Imported')
+                ];
+                // Ensure the row has at least 9 columns to match template width
+                while(row.length < 9) row.push(null);
+                exportData.push(row);
+            });
+
+            // 3. Create Worksheet and trigger download
+            const ws = XLSX.utils.aoa_to_sheet(exportData);
+
+            // 4. Create a Workbook
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "OTJ Log"); // Sheet name: OTJ Log
+
+            // 5. Write the file and trigger download
+            const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            const fileName = `otj_log_export_${dateStr}.xlsx`;
+            
+            XLSX.writeFile(wb, fileName);
+
+            showToast(`Log exported successfully to ${fileName}!`, 'bg-green-500');
+        }
+
+        // --- RENDER FUNCTIONS ---
+
+        function renderProgress() {
+            const container = document.getElementById('progress-tracker');
+            if (!container) return;
+
+            const totalLoggedHours = logEntries.reduce((sum, entry) => sum + entry.hours, 0);
+            const totalHoursWithClassroom = totalLoggedHours + goals.classroomHours;
+            const targetHours = goals.agreedTotalHours;
+            const percentage = Math.min(100, (totalHoursWithClassroom / targetHours) * 100);
+            const remainingHours = Math.max(0, targetHours - totalHoursWithClassroom);
+
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <!-- Progress Bar -->
+                    <div class="bg-gray-700 rounded-full h-8 overflow-hidden shadow-lg">
+                        <div
+                            class="h-8 bg-green-500 transition-all duration-500 ease-out flex items-center justify-center text-sm font-bold text-white"
+                            style="width: ${percentage.toFixed(1)}%"
+                        >
+                            ${percentage.toFixed(1)}% Complete
+                        </div>
+                    </div>
+
+                    <!-- Summary Cards -->
+                    <div class="grid grid-cols-2 gap-4 text-center">
+                        <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+                            <p class="text-3xl font-extrabold text-green-400">${totalHoursWithClassroom.toFixed(1)}</p>
+                            <p class="text-sm text-gray-400 mt-1">Total OTJ Hours Logged</p>
+                        </div>
+                        <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+                            <p class="text-3xl font-extrabold text-indigo-400">${targetHours}</p>
+                            <p class="text-sm text-gray-400 mt-1">Agreed Total Hours Target</p>
+                        </div>
+                        <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+                            <p class="text-2xl font-bold text-red-400">${remainingHours.toFixed(1)}</p>
+                            <p class="text-xs text-gray-400 mt-1">Hours Remaining</p>
+                        </div>
+                        <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+                            <p class="text-2xl font-bold text-yellow-400">${goals.classroomHours}</p>
+                            <p class="text-xs text-gray-400 mt-1">Classroom Hours (Pre-logged)</p>
+                        </div>
+                    </div>
+
+                    <!-- Detailed Metrics -->
+                    <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+                        <h3 class="text-lg font-semibold text-white mb-3 border-b border-gray-700 pb-2">Apprenticeship Timeline</h3>
+                        <div class="text-sm space-y-2 text-gray-300">
+                            <p><strong>Start Date:</strong> ${goals.startDate}</p>
+                            <p><strong>Gateway Date:</strong> ${goals.gatewayDate}</p>
+                            <p><strong>Minimum Required:</strong> ${goals.calculatedMinimum.toFixed(2)} hours</p>
+                            <p><strong>Log Entries Found:</strong> ${logEntries.length}</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderLog() {
+            const container = document.getElementById('log-list');
+            if (!container) return;
+
+            if (logEntries.length === 0) {
+                container.innerHTML = '<p class="text-center text-gray-400 p-4">No entries logged yet. Import your historical data or log a job!</p>';
+                return;
+            }
+
+            const listHtml = logEntries.map(entry => `
+                <div class="bg-gray-800 p-3 rounded-lg shadow-md border-l-4 ${entry.source === 'Imported' ? 'border-yellow-500' : 'border-indigo-500' } mb-2 transition-transform duration-200 hover:scale-[1.01]">
+                    <div class="flex justify-between items-center mb-1">
+                        <p class="text-sm font-semibold text-white">${entry.date}</p>
+                        <p class="text-xl font-bold ${entry.source === 'Imported' ? 'text-yellow-400' : 'text-green-400' }">${entry.hours.toFixed(1)}h</p>
+                    </div>
+                    <p class="text-sm text-gray-300">${entry.description}</p>
+                    <p class="text-xs text-right text-gray-500 mt-1">${entry.source || 'Real-Time'}</p>
+                </div>
+            `).join('');
+
+            container.innerHTML = `<div class="h-[60vh] overflow-y-auto pr-2">${listHtml}</div>`;
+        }
+
+        // --- UTILITY ---
+
+        function showToast(message, bgColor) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `fixed bottom-5 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-lg text-white font-bold transition-opacity duration-300 ${bgColor} z-50`;
+            toast.style.opacity = '1';
+
+            setTimeout(() => {
+                toast.style.opacity = '0';
+            }, 3000);
+        }
+
+        // Exposed globally for HTML inline onclick attributes
+        window.switchTab = function(tabName) {
+            document.querySelectorAll('.app-tab').forEach(tab => tab.classList.add('hidden'));
+            document.getElementById(tabName).classList.remove('hidden');
+
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('border-indigo-500', 'text-indigo-400', 'bg-gray-700'));
+            document.getElementById(`${tabName}-btn`).classList.add('border-indigo-500', 'text-indigo-400', 'bg-gray-700');
+
+            // NEW: Save the active tab to localStorage
+            localStorage.setItem('lastActiveTab', tabName);
+
+            // Ensure content is fresh when switching tabs
+            if (tabName === 'progress-tab') {
+                renderProgress();
+            }
+            if (tabName === 'log-tab') {
+                renderLog();
+            }
+        }
+
+        // --- EVENT LISTENERS ---
+        window.addEventListener('load', () => {
+            setupFirebase();
+
+            // Set today's date as default
+            document.getElementById('logDate').value = new Date().toISOString().split('T')[0];
+
+            document.getElementById('logForm').addEventListener('submit', addEntry);
+
+            // Initial view setup
+            // NEW: Retrieve the last active tab from localStorage, default to 'entry-tab'
+            const lastActiveTab = localStorage.getItem('lastActiveTab') || 'entry-tab';
+            window.switchTab(lastActiveTab);
+        });
+    </script>
+
+    <style>
+        /* Custom styles for a dark, mobile-friendly aesthetic */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1f2937; /* Dark Gray */
+        }
+        /* Custom scrollbar for log list */
+        .h-\[60vh\]::-webkit-scrollbar {
+            width: 8px;
+        }
+        .h-\[60vh\]::-webkit-scrollbar-thumb {
+            background-color: #4b5563;
+            border-radius: 4px;
+        }
+        .h-\[60vh\]::-webkit-scrollbar-track {
+            background-color: #1f2937;
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 text-white">
+
+    <div id="toast" style="opacity: 0;"></div>
+
+    <h1 class="text-2xl font-bold text-center mb-6 text-indigo-400">
+        Apprenticeship OTJ Log
+    </h1>
+
+    <!-- Tab Navigation -->
+    <div class="flex justify-around bg-gray-900 p-1 rounded-xl shadow-lg mb-6">
+        <button id="entry-tab-btn" class="tab-btn flex-1 py-3 text-lg font-semibold rounded-lg transition-colors border-b-4 border-transparent text-gray-300" onclick="switchTab('entry-tab')">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 inline-block mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            Log Job
+        </button>
+        <button id="progress-tab-btn" class="tab-btn flex-1 py-3 text-lg font-semibold rounded-lg transition-colors border-b-4 border-transparent text-gray-300" onclick="switchTab('progress-tab')">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 inline-block mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.001 0 0120.488 9z" />
+            </svg>
+            Progress
+        </button>
+        <button id="log-tab-btn" class="tab-btn flex-1 py-3 text-lg font-semibold rounded-lg transition-colors border-b-4 border-transparent text-gray-300" onclick="switchTab('log-tab')">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 inline-block mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2" />
+            </svg>
+            Full Log
+        </button>
+    </div>
+
+    <!-- 1. Log Entry Tab -->
+    <div id="entry-tab" class="app-tab hidden p-2">
+        <div class="bg-gray-900 p-6 rounded-xl shadow-2xl">
+            <h2 class="text-xl font-semibold mb-4 text-indigo-300">New OTJ Activity</h2>
+            <form id="logForm" class="space-y-4">
+                <div>
+                    <label for="logDate" class="block text-sm font-medium text-gray-400 mb-1">Date of Activity</label>
+                    <input type="date" id="logDate" required
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div>
+                    <label for="logDescription" class="block text-sm font-medium text-gray-400 mb-1">Description (What did you learn?)</label>
+                    <textarea id="logDescription" rows="3" required placeholder="e.g., Worked with my mentor to diagnose an unknown fault on a Vauxhall Corsa using a Snap-on diagnostic tablet."
+                              class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500"></textarea>
+                </div>
+                <div>
+                    <label for="logHours" class="block text-sm font-medium text-gray-400 mb-1">Hours Spent (e.g., 2.5)</label>
+                    <input type="number" id="logHours" step="0.01" min="0.1" required placeholder="0.0"
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <button type="submit"
+                        class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-lg transition duration-200 transform active:scale-95 disabled:bg-gray-500">
+                    <span class="text-lg">Log Job Now</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 2. Progress Tracker Tab -->
+    <div id="progress-tab" class="app-tab hidden p-2">
+        <div id="progress-tracker" class="bg-gray-900 p-6 rounded-xl shadow-2xl">
+            <!-- Progress content is injected here by JavaScript -->
+            <div class="text-center py-10 text-gray-400">Loading progress...</div>
+        </div>
+    </div>
+
+    <!-- 3. Full Log Tab -->
+    <div id="log-tab" class="app-tab hidden p-2">
+        <div class="bg-gray-900 p-6 rounded-xl shadow-2xl">
+            <!-- Export and Import Controls -->
+            <div class="space-y-4 mb-4 border-b border-gray-700 pb-4">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-xl font-semibold text-indigo-300">Full OTJ Log Entries</h2>
+                    <!-- Export Button (Updated to call exportToXlsx and reflect .xlsx format) -->
+                    <button onclick="exportToXlsx()"
+                        class="flex items-center space-x-2 px-3 py-2 bg-green-600 hover:bg-green-700 text-white font-bold text-sm rounded-lg shadow-md transition duration-200 transform active:scale-95">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
+                        </svg>
+                        <span>Export to Excel (XLSX)</span>
+                    </button>
+                </div>
+
+                <!-- Import Control -->
+                <div class="mt-2 p-3 bg-gray-800 rounded-lg border border-gray-700">
+                    <label for="file-upload" class="block text-sm font-medium text-yellow-400 mb-2">Import Historical Logs (CSV, XLSX, or XLS)</label>
+                    <input type="file" id="file-upload" 
+                           accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel" 
+                           onchange="handleFileImport(event)" 
+                           class="w-full text-sm text-gray-300 
+                                  file:mr-4 file:py-2 file:px-4
+                                  file:rounded-full file:border-0
+                                  file:text-sm file:font-semibold
+                                  file:bg-indigo-500 file:text-white
+                                  hover:file:bg-indigo-600"/>
+                    <p class="text-xs text-gray-500 mt-2">
+                        **Action Required:** Re-import your master Excel file to save the template rows for export.
+                    </p>
+                </div>
+            </div>
+            
+            <div id="log-list">
+                <!-- Log entries are injected here by JavaScript -->
+                <p class="text-center text-gray-400 p-4">Loading log entries...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Authentication Status -->
+    <p id="auth-status" class="text-xs text-center text-gray-500 mt-4">Loading application...</p>
+
+</body>
+</html>
