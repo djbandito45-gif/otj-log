@@ -13,9 +13,35 @@
         import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, serverTimestamp, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+        // These variables are required for the app to function securely in this environment.
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const firebaseConfigEnv = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Inside Canvas, we MUST use the environment-provided configuration
+        const firebaseConfig = firebaseConfigEnv; 
+
+
+        // --- CUSTOM FIREBASE CONFIGURATION (FOR EXTERNAL USE/GITHUB) ---
+        /*
+         * If you export this file for use outside of the Canvas environment (e.g., on GitHub),
+         * you should uncomment the lines below and use YOUR_CUSTOM_FIREBASE_CONFIG instead of firebaseConfigEnv.
+         * * Important: Replace the placeholder values below with your actual Firebase project configuration.
+         * Note that this application also relies on a Firebase Custom Auth Token, which you would need 
+         * to handle on your own server when running outside of Canvas.
+         *
+        const firebaseConfig = {
+  apiKey: "AIzaSyCYjp_KTHFc8zAdf4WAbXtNjw-WGJIjE6A",
+  authDomain: "off-the-job-log.firebaseapp.com",
+  projectId: "off-the-job-log",
+  storageBucket: "off-the-job-log.firebasestorage.app",
+  messagingSenderId: "543791232927",
+  appId: "1:543791232927:web:c463f6710c9155249c6faa",
+  measurementId: "G-QC2VQS6GZB"
+};
+        */ // <-- FIX: Added missing closing comment block to resolve SyntaxError.
+        // ------------------------------------------------------------------
+
 
         // --- APPLICATION STATE ---
         let db;
@@ -38,12 +64,10 @@
         // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
         async function setupFirebase() {
             try {
-                if (!firebaseConfig) {
-                    throw new Error("Firebase configuration is missing.");
-                }
-
                 // Set log level to debug to better monitor auth flow
                 setLogLevel('debug'); 
+                
+                // Initialize using the determined config (environment-provided or custom)
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
@@ -57,7 +81,7 @@
                         await initMetadata(); // Load template and goals (still public/shared)
                         setupLogListener(); // Now loads private data
                     } else {
-                        // This branch runs on initial load if no persistent session is found.
+                        // This branch runs on initial load if no persistent session is found or if the user is being initialized.
                         
                         // Attempt silent sign-in if token is available
                         try {
@@ -72,14 +96,13 @@
                             document.getElementById('auth-status').textContent = `Auth Attempt Failed: ${e.message.slice(0, 50)}...`;
                         }
                         
-                        // FIX: Explicitly set isAuthReady = true here.
-                        // This signals that the initial authentication attempt has completed, 
-                        // even if it failed (in which case userId will still be null). 
-                        // This prevents the race condition in addEntry().
+                        // Explicitly set isAuthReady = true here, regardless of sign-in success, 
+                        // to ensure the application state is ready to process user actions 
+                        // (and stop blocking the 'addEntry' function).
                         if (!userId) { 
                             isAuthReady = true;
-                            document.getElementById('auth-status').textContent = `Log Scope: Anonymous or Failed Auth. Try again.`;
-                            console.log("Firebase Auth Process finished initial run. isAuthReady = true. userId is null.");
+                            document.getElementById('auth-status').textContent = `Log Scope: Anonymous or Failed Auth. Log entries will not persist unless authenticated.`;
+                            console.log("Firebase Auth Process finished initial run. isAuthReady = true. userId is null/anonymous.");
                         }
 
                         renderProgress();
@@ -89,6 +112,7 @@
 
             } catch (error) {
                 console.error("Firebase setup failed:", error);
+                // If initialization fails due to a truly missing config, display the error
                 document.getElementById('auth-status').textContent = `Authentication Error: ${error.message}`;
                 isAuthReady = true; 
                 renderProgress();
@@ -206,6 +230,7 @@
             event.preventDefault();
             // This check now relies primarily on 'userId' if 'isAuthReady' is true.
             if (!isAuthReady || !db || !userId) {
+                // This warning catches the initial state before auth completes AND the state where auth failed to get a user ID.
                 showToast("App is still loading or failed to authenticate. Cannot save log.", 'bg-yellow-500');
                 return;
             }
@@ -503,7 +528,13 @@
 
         // --- EVENT LISTENERS ---
         window.addEventListener('load', () => {
-            setupFirebase();
+            // Check if config exists before calling setup
+            if (firebaseConfig) {
+                 setupFirebase();
+            } else {
+                console.error("Critical Error: Firebase config variable is unavailable in the environment.");
+                document.getElementById('auth-status').textContent = "Initialization Failed: Firebase configuration is missing.";
+            }
 
             // Set today's date as default
             document.getElementById('logDate').value = new Date().toISOString().split('T')[0];
