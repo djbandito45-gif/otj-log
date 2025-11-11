@@ -12,35 +12,33 @@
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, serverTimestamp, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+        // --- IMPORTANT FIREBASE SECURITY RULES FIX ---
+        /*
+         * THE ERROR "Missing or insufficient permissions" IS CAUSED BY YOUR FIREBASE SECURITY RULES.
+         * The code logic is correct, but your rules must allow authenticated users to access these paths.
+         * * YOU MUST SET THE FOLLOWING RULES IN YOUR FIREBASE CONSOLE:
+         * * service cloud.firestore {
+         * match /databases/{database}/documents {
+         * function isAuthenticated() { return request.auth != null; }
+         * * // 1. PUBLIC/SHARED DATA (Goals & Template) - Allow all authenticated users read/write
+         * match /artifacts/{appId}/public/data/otj_metrics/{docId} {
+         * allow read, write: if isAuthenticated();
+         * }
+         *
+         * // 2. PRIVATE/USER DATA (Log Entries) - Allow only the owner (request.auth.uid) read/write
+         * match /artifacts/{appId}/users/{userId}/otj_entries/{docId} {
+         * allow read, write: if isAuthenticated() && request.auth.uid == userId;
+         * }
+         * }
+         * }
+         */
+        // ---------------------------------------------
+        
         // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
-        // These variables are required for the app to function securely in this environment.
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfigEnv = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-        
-        // Inside Canvas, we MUST use the environment-provided configuration
         const firebaseConfig = firebaseConfigEnv; 
-
-
-        // --- CUSTOM FIREBASE CONFIGURATION (FOR EXTERNAL USE/GITHUB) ---
-        /*
-         * If you export this file for use outside of the Canvas environment (e.g., on GitHub),
-         * you should uncomment the lines below and use YOUR_CUSTOM_FIREBASE_CONFIG instead of firebaseConfigEnv.
-         * * Important: Replace the placeholder values below with your actual Firebase project configuration.
-         * Note that this application also relies on a Firebase Custom Auth Token, which you would need 
-         * to handle on your own server when running outside of Canvas.
-         *
-        const firebaseConfig = {
-  apiKey: "AIzaSyCYjp_KTHFc8zAdf4WAbXtNjw-WGJIjE6A",
-  authDomain: "off-the-job-log.firebaseapp.com",
-  projectId: "off-the-job-log",
-  storageBucket: "off-the-job-log.firebasestorage.app",
-  messagingSenderId: "543791232927",
-  appId: "1:543791232927:web:c463f6710c9155249c6faa",
-  measurementId: "G-QC2VQS6GZB"
-};
-        */ 
-        // ------------------------------------------------------------------
 
 
         // --- APPLICATION STATE ---
@@ -48,11 +46,12 @@
         let auth;
         let userId = null;
         let isAuthReady = false;
-        let logEntries = []; // Combined array of Firestore and Imported data
-        let importedEntries = []; // Entries loaded from the user's uploaded CSV file
+        // logEntries now holds ALL data, both manually entered and imported, fetched from Firestore.
+        let logEntries = []; 
         
         let metadataRows = []; // Stores all template rows (metadata + header row) for export (Public/Shared)
 
+        // Initial default goals
         let goals = {
             agreedTotalHours: 1100,
             calculatedMinimum: 1068.73,
@@ -64,40 +63,31 @@
         // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
         async function setupFirebase() {
             try {
-                // Set log level to debug to better monitor auth flow
                 setLogLevel('debug'); 
                 
-                // 1. Initialize using the determined config (environment-provided or custom)
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
 
-                // 2. Auth State Listener: This is the source of truth for setting user/ready state.
                 onAuthStateChanged(auth, async (user) => {
                     if (user) {
-                        // User successfully authenticated (custom token or anonymous success)
                         userId = user.uid;
                         document.getElementById('auth-status').textContent = `Log Scope: Private (User ID: ${userId})`;
-                        console.log("Firebase Auth Ready. User:", userId);
-                        await initMetadata(); // Load template and goals (still public/shared)
-                        setupLogListener(); // Load private data
+                        await initMetadata(); 
+                        setupLogListener(); 
                     } else {
-                        // No user or user signed out/failed auth
                         userId = null;
                         document.getElementById('auth-status').textContent = `Log Scope: Anonymous or Failed Auth. Log entries will not persist unless authenticated.`;
-                        console.log("Firebase Auth Ready. User is Anonymous/Null.");
-                        // We still need to load public metadata and listen for any existing local data
                         await initMetadata();
                         setupLogListener(); 
                     }
                     
-                    // CRITICAL FIX: Set ready state only after the initial check/sign-in attempt is done
                     isAuthReady = true; 
                     renderProgress();
                     renderLog();
+                    renderGoalsForm(); 
                 });
 
-                // 3. Initial Sign-In Attempt: This runs immediately and triggers the onAuthStateChanged listener above.
                 try {
                     if (initialAuthToken && initialAuthToken.length > 0) {
                         await signInWithCustomToken(auth, initialAuthToken);
@@ -106,81 +96,88 @@
                     }
                 } catch(e) {
                     console.error("Initial authentication failed during attempt. Proceeding with anonymous state:", e);
-                    // The onAuthStateChanged listener will handle the resulting anonymous/null user state.
                 }
 
             } catch (error) {
                 console.error("Firebase setup failed:", error);
-                // If initialization fails due to a truly missing config, display the error
                 document.getElementById('auth-status').textContent = `Authentication Error: ${error.message}`;
-                isAuthReady = true; // Still mark as ready to unblock the UI, even if DB ops will fail
+                isAuthReady = true; 
                 renderProgress();
             }
         }
 
         // --- METADATA/GOALS MANAGEMENT (PUBLIC/SHARED) ---
-        // These remain public as they define the common apprenticeship structure.
 
         const getGoalsRef = () => doc(db, "artifacts", appId, "public", "data", "otj_metrics", "goals");
         const getTemplateRef = () => doc(db, "artifacts", appId, "public", "data", "otj_metrics", "template");
 
         async function initMetadata() {
             if (!db) return;
-            // Load Goals
-            const goalsRef = getGoalsRef();
-            const docSnap = await getDoc(goalsRef);
-            if (docSnap.exists()) {
-                goals = { ...goals, ...docSnap.data() };
-            }
-
-            // Load Template Metadata
-            const templateSnap = await getDoc(getTemplateRef());
-            if (templateSnap.exists() && templateSnap.data().rows) {
-                try {
-                    // FIX: Parse the JSON string retrieved from Firestore back into an array of arrays.
-                    metadataRows = JSON.parse(templateSnap.data().rows);
-                } catch (e) {
-                    console.error("Error parsing metadata rows:", e);
-                    metadataRows = [];
+            try {
+                // Load Goals
+                const goalsRef = getGoalsRef();
+                const docSnap = await getDoc(goalsRef);
+                if (docSnap.exists()) {
+                    goals = { ...goals, ...docSnap.data() };
                 }
+
+                // Load Template Metadata
+                const templateSnap = await getDoc(getTemplateRef());
+                if (templateSnap.exists() && templateSnap.data().rows) {
+                    try {
+                        metadataRows = JSON.parse(templateSnap.data().rows);
+                    } catch (e) {
+                        console.error("Error parsing metadata rows:", e);
+                        metadataRows = [];
+                    }
+                }
+            } catch (error) {
+                console.error("Failed to initialize public metadata (Goals/Template). Check security rules for /public/data/ path.", error);
             }
+            renderProgress();
+            renderGoalsForm();
         }
 
         async function saveGoals(newGoals) {
             if (!db) return;
             try {
+                const totalHours = parseFloat(newGoals.agreedTotalHours);
+                if (totalHours > 0) {
+                     newGoals.calculatedMinimum = totalHours * 0.9715; 
+                }
+                
                 await setDoc(getGoalsRef(), newGoals, { merge: true });
-                goals = newGoals;
-                renderProgress();
+                goals = newGoals; 
+                renderProgress(); 
+                renderGoalsForm(); 
+                showToast("Apprenticeship goals updated!", 'bg-green-500');
             } catch (e) {
                 console.error("Error saving goals:", e);
+                showToast("Failed to save goals. Check security rules for /public/data/ path.", 'bg-red-500');
             }
         }
 
         async function saveTemplateMetadata(rows) {
             if (!db) return;
             try {
-                // FIX: Stringify the nested array (rows) before saving to avoid Firestore nested array error.
                 await setDoc(getTemplateRef(), { rows: JSON.stringify(rows) }, { merge: true });
             } catch (e) {
                 console.error("Error saving template metadata:", e);
+                showToast("Failed to save template. Check security rules for /public/data/ path.", 'bg-red-500');
             }
         }
 
         // --- LOG ENTRY MANAGEMENT (PRIVATE/USER-SPECIFIC) ---
 
-        // NEW: Data is stored in a PRIVATE collection for individual user security.
         const getEntriesCollectionRef = () => {
             if (!userId || !db) return null;
-            // Path change: from 'public' to 'users/${userId}'
             return collection(db, "artifacts", appId, "users", userId, "otj_entries");
         };
 
         function setupLogListener() {
             if (!db || !userId) {
-                // Load only imported data if Firebase isn't ready or user is anonymous
-                logEntries = [...importedEntries];
-                logEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
+                // If not authenticated, clear entries and wait for auth.
+                logEntries = [];
                 renderProgress();
                 renderLog();
                 return;
@@ -191,11 +188,11 @@
 
             const q = query(entriesRef);
 
+            // onSnapshot loads all existing data and listens for changes
             onSnapshot(q, (snapshot) => {
                 let firestoreEntries = [];
                 snapshot.forEach((doc) => {
                     const data = doc.data();
-                    // Handle Firestore Timestamp objects or plain date strings
                     const dateStr = data.date instanceof Date ? data.date.toISOString().split('T')[0] : data.date;
 
                     firestoreEntries.push({
@@ -204,31 +201,29 @@
                         description: data.description,
                         hours: parseFloat(data.hours),
                         timestamp: data.timestamp,
-                        source: 'Real-Time'
+                        source: data.source || 'Real-Time' // Default to Real-Time if source is missing
                     });
                 });
 
-                // Combine imported CSV data and private Firestore data
-                logEntries = [...importedEntries, ...firestoreEntries];
+                // Set the combined, unified log entries
+                logEntries = firestoreEntries;
                 
                 // Client-side sort: sorting by date (latest first)
                 logEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-                console.log(`Received ${firestoreEntries.length} new private log entries. Total: ${logEntries.length}`);
+                console.log(`Loaded ${logEntries.length} log entries from Firestore.`);
                 renderProgress();
                 renderLog();
             }, (error) => {
-                console.error("Error setting up log listener:", error);
-                showToast("Failed to load real-time log entries.", 'bg-red-500');
+                console.error("Error setting up log listener (Likely permission issue for user log):", error);
+                showToast("Failed to load real-time log entries. Check security rules for /users/{userId}/ path.", 'bg-red-500');
             });
         }
 
         async function addEntry(event) {
             event.preventDefault();
-            // This check now relies primarily on 'userId' if 'isAuthReady' is true.
             if (!isAuthReady || !db || !userId) {
-                // This warning catches the initial state before auth completes AND the state where auth failed to get a user ID.
-                showToast("App is still loading or failed to authenticate. Cannot save log.", 'bg-yellow-500');
+                showToast("Authentication required to save entries. Please refresh and ensure you're logged in.", 'bg-red-500');
                 return;
             }
 
@@ -245,31 +240,29 @@
                 date: date,
                 description: description,
                 hours: parseFloat(hours),
-                timestamp: serverTimestamp()
+                timestamp: serverTimestamp(),
+                source: 'Real-Time'
             };
 
             try {
                 const entriesRef = getEntriesCollectionRef();
-                if (!entriesRef) throw new Error("Authentication not complete. Cannot save log.");
-                
                 await addDoc(entriesRef, newEntry);
                 showToast("Log entry saved successfully!", 'bg-green-500');
                 // Clear the form
                 document.getElementById('logForm').reset();
-                document.getElementById('logDate').value = new Date().toISOString().split('T')[0]; // Reset to today's date
+                document.getElementById('logDate').value = new Date().toISOString().split('T')[0];
             } catch (e) {
                 console.error("Error adding document: ", e);
-                showToast(`Error saving: ${e.message}`, 'bg-red-500');
+                showToast(`Error saving: ${e.message}. Check security rules for /users/{userId}/ path.`, 'bg-red-500');
             }
         }
 
-        // --- IMPORT FUNCTIONALITY ---
+        // --- IMPORT FUNCTIONALITY (UPDATED TO SAVE TO FIREBASE) ---
         
         // Simple CSV parser for the expected structure (Date, Description, ..., Hours)
         function parseCsvData(csvText, allRows) {
             const newEntries = [];
 
-            // Find the header row (assuming 'Activity Description' is present)
             let dataStartRow = 0;
             const lines = csvText.split('\n');
             const headerIndex = lines.findIndex(line => line.includes('Activity Description'));
@@ -280,23 +273,19 @@
                 dataStartRow = 7; 
             }
 
-            // --- Capture Metadata Rows ---
+            // Capture and save Metadata Rows for export
             if (allRows && allRows.length > 0) {
                  const capturedTemplate = allRows.slice(0, dataStartRow);
-                 // Save for persistent export templating
                  saveTemplateMetadata(capturedTemplate); 
-                 metadataRows = capturedTemplate; // Update local state immediately
+                 metadataRows = capturedTemplate; 
             }
 
-
+            // Parse actual log entries
             for (let i = dataStartRow; i < lines.length; i++) {
                 const line = lines[i].trim();
                 if (!line) continue;
 
-                // Simple comma split
                 const columns = line.split(',');
-                
-                // Based on your original file structure: Col 0(Date), Col 1(Desc), Col 6(Hours)
                 
                 const date = columns[0].trim();
                 const description = columns[1] ? columns[1].trim().replace(/"/g, '') : '';
@@ -307,16 +296,21 @@
                         date: date,
                         description: description,
                         hours: hours,
-                        source: 'Imported'
+                        source: 'Imported' // Mark the source as imported
                     });
                 }
             }
             return newEntries;
         }
 
-        window.handleFileImport = function(event) {
+        window.handleFileImport = async function(event) {
             const file = event.target.files[0];
             if (!file) return;
+
+            if (!isAuthReady || !userId) {
+                showToast("Cannot import: Authentication is not complete or you are not logged in.", 'bg-red-500');
+                return;
+            }
 
             const fileName = file.name.toLowerCase();
             if (!(fileName.endsWith('.csv') || fileName.endsWith('.xlsx') || fileName.endsWith('.xls'))) {
@@ -324,9 +318,11 @@
                 return;
             }
 
+            showToast("Parsing and saving imported file entries...", 'bg-indigo-500');
+
             const reader = new FileReader();
 
-            reader.onload = (e) => {
+            reader.onload = async (e) => {
                 try {
                     const data = new Uint8Array(e.target.result);
                     const workbook = XLSX.read(data, { type: 'array' });
@@ -334,19 +330,28 @@
                     const sheetName = workbook.SheetNames[0];
                     const worksheet = workbook.Sheets[sheetName];
                     
-                    // Convert the entire sheet to an array of arrays (AoA) to capture metadata rows
                     const allRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false });
-                    
-                    // Convert the sheet data to a CSV string for our existing parser (needs raw text for splitting)
                     const csvText = XLSX.utils.sheet_to_csv(worksheet, { FS: ',', RS: '\n' });
 
                     const newEntries = parseCsvData(csvText, allRows);
 
                     if (newEntries.length > 0) {
-                        importedEntries = newEntries;
-                        setupLogListener(); // Re-trigger listener to combine data
-                        showToast(`Successfully imported ${newEntries.length} historical entries from '${sheetName}'! 
-                                  Template saved for export.`, 'bg-green-500');
+                        const entriesRef = getEntriesCollectionRef();
+                        let savedCount = 0;
+                        
+                        // --- CRITICAL FIX: Loop and save each entry to Firestore ---
+                        for (const entry of newEntries) {
+                            try {
+                                // Add timestamp when saving to ensure order consistency
+                                await addDoc(entriesRef, { ...entry, timestamp: serverTimestamp() });
+                                savedCount++;
+                            } catch (saveError) {
+                                console.error("Error saving imported entry:", entry, saveError);
+                            }
+                        }
+                        
+                        // The onSnapshot listener will automatically refresh the UI.
+                        showToast(`Successfully imported and saved ${savedCount} historical entries!`, 'bg-green-500');
                     } else {
                         showToast("Could not parse any valid entries. Ensure Date (A), Description (B), and Hours (G) columns are correct.", 'bg-red-500');
                     }
@@ -366,16 +371,14 @@
                 return;
             }
             
-            // 1. Start with the saved template metadata (top rows of the spreadsheet, including the original header)
             const exportData = [...metadataRows]; 
 
-            // Check for missing template: If template is missing, warn and use a fallback header
             if (exportData.length === 0) {
                  showToast("Warning: No template imported. Exporting with default headers.", 'bg-yellow-500');
                  exportData.push(["Date", "Activity Description", null, null, null, null, "Hours", "Initials of Signer", "Source"]);
             }
 
-            // 2. Append all log entries to the final export data structure
+            // Append all log entries (now unified from Firestore)
             logEntries.forEach(entry => {
                 const row = [
                     entry.date, 
@@ -385,22 +388,17 @@
                     null, 
                     null, 
                     entry.hours, 
-                    "", // H: Initials (left blank for user to manually sign/fill)
-                    entry.source || (entry.id ? 'Real-Time (Firestore)' : 'Imported')
+                    "", 
+                    entry.source || 'Real-Time' // Use the source field to differentiate
                 ];
-                // Ensure the row has at least 9 columns to match template width
                 while(row.length < 9) row.push(null);
                 exportData.push(row);
             });
 
-            // 3. Create Worksheet and trigger download
             const ws = XLSX.utils.aoa_to_sheet(exportData);
-
-            // 4. Create a Workbook
             const wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, ws, "OTJ Log"); // Sheet name: OTJ Log
+            XLSX.utils.book_append_sheet(wb, ws, "OTJ Log"); 
 
-            // 5. Write the file and trigger download
             const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
             const fileName = `otj_log_export_${dateStr}.xlsx`;
             
@@ -490,6 +488,43 @@
             container.innerHTML = `<div class="h-[60vh] overflow-y-auto pr-2">${listHtml}</div>`;
         }
 
+        function renderGoalsForm() {
+            if (document.getElementById('goalsForm')) {
+                document.getElementById('totalHours').value = goals.agreedTotalHours || '';
+                document.getElementById('classroomHours').value = goals.classroomHours || '';
+                document.getElementById('startDate').value = goals.startDate || '';
+                document.getElementById('gatewayDate').value = goals.gatewayDate || '';
+            }
+        }
+
+        window.saveSettings = function(event) {
+            event.preventDefault();
+            
+            if (!isAuthReady || !db) {
+                showToast("App is still loading or failed to connect to database. Please wait.", 'bg-yellow-500');
+                return;
+            }
+
+            const newTotalHours = parseFloat(document.getElementById('totalHours').value);
+            const newClassroomHours = parseFloat(document.getElementById('classroomHours').value);
+            const newStartDate = document.getElementById('startDate').value;
+            const newGatewayDate = document.getElementById('gatewayDate').value;
+            
+            if (isNaN(newTotalHours) || isNaN(newClassroomHours) || newTotalHours <= 0 || newClassroomHours < 0 || !newStartDate || !newGatewayDate) {
+                showToast("Please enter valid, positive numbers for hours and select valid dates.", 'bg-yellow-500');
+                return;
+            }
+            
+            const newGoals = {
+                agreedTotalHours: newTotalHours,
+                classroomHours: newClassroomHours,
+                startDate: newStartDate,
+                gatewayDate: newGatewayDate,
+            };
+
+            saveGoals(newGoals);
+        }
+
         // --- UTILITY ---
 
         function showToast(message, bgColor) {
@@ -503,7 +538,6 @@
             }, 3000);
         }
 
-        // Exposed globally for HTML inline onclick attributes
         window.switchTab = function(tabName) {
             document.querySelectorAll('.app-tab').forEach(tab => tab.classList.add('hidden'));
             document.getElementById(tabName).classList.remove('hidden');
@@ -511,21 +545,21 @@
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('border-indigo-500', 'text-indigo-400', 'bg-gray-700'));
             document.getElementById(`${tabName}-btn`).classList.add('border-indigo-500', 'text-indigo-400', 'bg-gray-700');
 
-            // NEW: Save the active tab to localStorage
             localStorage.setItem('lastActiveTab', tabName);
 
-            // Ensure content is fresh when switching tabs
             if (tabName === 'progress-tab') {
                 renderProgress();
             }
             if (tabName === 'log-tab') {
                 renderLog();
             }
+            if (tabName === 'settings-tab') {
+                renderGoalsForm();
+            }
         }
 
         // --- EVENT LISTENERS ---
         window.addEventListener('load', () => {
-            // Check if config exists before calling setup
             if (firebaseConfig) {
                  setupFirebase();
             } else {
@@ -533,13 +567,10 @@
                 document.getElementById('auth-status').textContent = "Initialization Failed: Firebase configuration is missing.";
             }
 
-            // Set today's date as default
             document.getElementById('logDate').value = new Date().toISOString().split('T')[0];
 
             document.getElementById('logForm').addEventListener('submit', addEntry);
 
-            // Initial view setup
-            // NEW: Retrieve the last active tab from localStorage, default to 'entry-tab'
             const lastActiveTab = localStorage.getItem('lastActiveTab') || 'entry-tab';
             window.switchTab(lastActiveTab);
         });
@@ -592,6 +623,14 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2" />
             </svg>
             Full Log
+        </button>
+        <!-- NEW: Settings Tab Button -->
+        <button id="settings-tab-btn" class="tab-btn flex-1 py-3 text-lg font-semibold rounded-lg transition-colors border-b-4 border-transparent text-gray-300" onclick="switchTab('settings-tab')">
+             <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 inline-block mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.568.342 1.258.113 1.724-.106z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            Settings
         </button>
     </div>
 
@@ -661,7 +700,7 @@
                                   file:bg-indigo-500 file:text-white
                                   hover:file:bg-indigo-600"/>
                     <p class="text-xs text-gray-500 mt-2">
-                        **Action Required:** Re-import your master Excel file to save the template rows for export.
+                        **Action Required:** Import your master Excel file ONCE. The entries will be saved automatically and loaded on subsequent visits.
                     </p>
                 </div>
             </div>
@@ -672,6 +711,51 @@
             </div>
         </div>
     </div>
+    
+    <!-- 4. NEW: Settings Tab -->
+    <div id="settings-tab" class="app-tab hidden p-2">
+        <div class="bg-gray-900 p-6 rounded-xl shadow-2xl">
+            <h2 class="text-xl font-semibold mb-4 text-indigo-300">Apprenticeship Goals & Dates</h2>
+            <form id="goalsForm" class="space-y-4" onsubmit="saveSettings(event)">
+                <p class="text-sm text-gray-400">These settings are shared across all your devices and are used to calculate your progress accurately.</p>
+                
+                <!-- Agreed Total Hours -->
+                <div>
+                    <label for="totalHours" class="block text-sm font-medium text-gray-400 mb-1">Agreed Total OTJ Hours Target</label>
+                    <input type="number" id="totalHours" step="1" min="1" required placeholder="1100"
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                
+                <!-- Classroom Hours -->
+                <div>
+                    <label for="classroomHours" class="block text-sm font-medium text-gray-400 mb-1">Pre-Logged Classroom Hours</label>
+                    <input type="number" id="classroomHours" step="1" min="0" required placeholder="360"
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                    <p class="text-xs text-gray-500 mt-1">Include any hours already signed off (e.g., initial block training).</p>
+                </div>
+                
+                <!-- Start Date -->
+                <div>
+                    <label for="startDate" class="block text-sm font-medium text-gray-400 mb-1">Apprenticeship Start Date</label>
+                    <input type="date" id="startDate" required
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+
+                <!-- Gateway Date -->
+                <div>
+                    <label for="gatewayDate" class="block text-sm font-medium text-gray-400 mb-1">Planned Gateway Date</label>
+                    <input type="date" id="gatewayDate" required
+                           class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                
+                <button type="submit"
+                        class="w-full py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-xl shadow-lg transition duration-200 transform active:scale-95 disabled:bg-gray-500">
+                    <span class="text-lg">Save Goals</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
 
     <!-- Authentication Status -->
     <p id="auth-status" class="text-xs text-center text-gray-500 mt-4">Loading application...</p>
