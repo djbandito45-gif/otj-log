@@ -42,7 +42,8 @@
                     throw new Error("Firebase configuration is missing.");
                 }
 
-                setLogLevel('error');
+                // Set log level to debug to better monitor auth flow
+                setLogLevel('debug'); 
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
@@ -56,13 +57,33 @@
                         await initMetadata(); // Load template and goals (still public/shared)
                         setupLogListener(); // Now loads private data
                     } else {
+                        // This branch runs on initial load if no persistent session is found.
+                        
                         // Attempt silent sign-in if token is available
-                        if (initialAuthToken && initialAuthToken.length > 0) {
-                            await signInWithCustomToken(auth, initialAuthToken);
-                        } else {
-                            // Fallback to anonymous sign-in
-                            await signInAnonymously(auth);
+                        try {
+                            if (initialAuthToken && initialAuthToken.length > 0) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch(e) {
+                            // Error during sign-in attempt
+                            console.error("Authentication failed during attempt. Proceeding without logged-in user:", e);
+                            document.getElementById('auth-status').textContent = `Auth Attempt Failed: ${e.message.slice(0, 50)}...`;
                         }
+                        
+                        // FIX: Explicitly set isAuthReady = true here.
+                        // This signals that the initial authentication attempt has completed, 
+                        // even if it failed (in which case userId will still be null). 
+                        // This prevents the race condition in addEntry().
+                        if (!userId) { 
+                            isAuthReady = true;
+                            document.getElementById('auth-status').textContent = `Log Scope: Anonymous or Failed Auth. Try again.`;
+                            console.log("Firebase Auth Process finished initial run. isAuthReady = true. userId is null.");
+                        }
+
+                        renderProgress();
+                        setupLogListener();
                     }
                 });
 
@@ -183,6 +204,7 @@
 
         async function addEntry(event) {
             event.preventDefault();
+            // This check now relies primarily on 'userId' if 'isAuthReady' is true.
             if (!isAuthReady || !db || !userId) {
                 showToast("App is still loading or failed to authenticate. Cannot save log.", 'bg-yellow-500');
                 return;
