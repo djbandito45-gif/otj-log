@@ -92,7 +92,13 @@
             // Load Template Metadata
             const templateSnap = await getDoc(getTemplateRef());
             if (templateSnap.exists() && templateSnap.data().rows) {
-                metadataRows = templateSnap.data().rows;
+                try {
+                    // FIX: Parse the JSON string retrieved from Firestore back into an array of arrays.
+                    metadataRows = JSON.parse(templateSnap.data().rows);
+                } catch (e) {
+                    console.error("Error parsing metadata rows:", e);
+                    metadataRows = [];
+                }
             }
             
             renderProgress();
@@ -112,8 +118,8 @@
         async function saveTemplateMetadata(rows) {
             if (!db) return;
             try {
-                // Ensure rows array is saved correctly
-                await setDoc(getTemplateRef(), { rows: rows }, { merge: true });
+                // FIX: Stringify the nested array (rows) before saving to avoid Firestore nested array error.
+                await setDoc(getTemplateRef(), { rows: JSON.stringify(rows) }, { merge: true });
             } catch (e) {
                 console.error("Error saving template metadata:", e);
             }
